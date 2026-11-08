@@ -1,0 +1,13 @@
+#!/bin/sh
+# Start the signal-bridge daemon in the background (used by libsignal-purple, can be run by hand too). Does nothing when it already runs.
+# Log: ~/.local/share/signal-bridge/daemon.log (cut to the last 200 lines when it grows over 1 MB).
+D="${HOME:-/home/user}/.local/share/signal-bridge"
+mkdir -p "$D"
+chmod 700 "$D" 2>/dev/null
+L="$D/daemon.log"
+if [ -f "$L" ] && [ "$(wc -c < "$L")" -gt 1048576 ]; then
+    tail -n 200 "$L" > "$L.tmp" && mv "$L.tmp" "$L"
+fi
+# the daemon itself refuses to start twice (it checks the socket)
+nohup /opt/signal-bridge/bin/signal-bridge daemon >> "$L" 2>&1 < /dev/null &
+exit 0

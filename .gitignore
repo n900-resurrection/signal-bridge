@@ -1,0 +1,9 @@
+target/
+*~
+*.swp
+.vscode/
+.DS_Store
+# a Signal store, its passphrase and keys must never be committed
+*.sqlite
+*.sqlite-*
+gurk.toml

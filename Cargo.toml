@@ -1,0 +1,30 @@
+[package]
+name = "signal-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Signal daemon for the Nokia N900: presage behind a local socket with a simple line protocol"
+
+[workspace]
+
+[profile.release]
+debug = 0
+lto = "thin"
+
+[dependencies]
+# the same presage revision and features as gurk-rs, so that the dependencies built for gurk are reused
+presage = { git = "https://github.com/whisperfish/presage", rev = "94b3978f5456469cfd4d9f72351a5eff93715f81", default-features = false }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "94b3978f5456469cfd4d9f72351a5eff93715f81", default-features = false }
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
+
+anyhow = "1.0.94"
+clap = { version = "4.5.23", features = ["derive", "env"] }
+futures = "0.3"
+hex = "0.4.3"
+tokio = { version = "1.42.0", default-features = false, features = ["rt", "macros", "net", "time", "io-util", "sync"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+[patch.crates-io]
+# the same patched sqlite as gurk-rs (custom crypto provider, no atexit cleanup)
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/boxdot/rusqlite", rev = 'a2f393913d9994645c94810498bef07b2183b3dc' }
