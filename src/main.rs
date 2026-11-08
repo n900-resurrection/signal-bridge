@@ -29,6 +29,7 @@ use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context as _};
@@ -45,7 +46,7 @@ use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::SyncMessage;
 use presage::store::{ContentsStore, Thread};
 use presage::Manager;
-use presage_store_sqlite::SqliteStore;
+use presage_store_sqlite::{SqliteConnectOptions, SqliteStore};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -125,7 +126,17 @@ async fn open_store(args: &Args) -> anyhow::Result<SqliteStore> {
     }
     let pass = passphrase(args)?;
     info!(store = %path.display(), encrypted = pass.is_some(), "opening the store");
-    SqliteStore::open_with_passphrase(path.to_str().context("store path")?, pass.as_deref(), OnNewIdentity::Trust)
+    // Same as SqliteStore::open_with_passphrase, but with a long busy timeout: decrypting a burst of messages on the slow flash of the
+    // phone made writers wait more than the default 5 s ("database is locked", the message was skipped).
+    let mut options = SqliteConnectOptions::from_str(path.to_str().context("store path")?)
+        .context("store path")?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(60));
+    if let Some(p) = pass.as_deref() {
+        options = options.pragma("key", format!("'{}'", p.replace('\'', "''")));
+    }
+    SqliteStore::open_with_options(options, OnNewIdentity::Trust)
         .await
         .context("cannot open the store (wrong passphrase?)")
 }
