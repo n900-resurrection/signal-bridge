@@ -17,7 +17,8 @@
 //! Bridge to client:
 //!   READY  UUID  PHONE            sent on connect: our own identity
 //!   OK  ID  TIMESTAMP | ERR  ID  REASON
-//!   CONTACT  UUID  NAME  PHONE | GROUP  KEY  TITLE
+//!   CONTACT  UUID  NAME  PHONE | GROUP  KEY  TITLE   (NAME: address book name, else profile name, else empty)
+//!   CONTACTS-CHANGED              the contact list or the names changed: ask CONTACTS again
 //!   MSG   UUID  TIMESTAMP  TEXT   received in a chat with a contact (UUID = the sender)
 //!   GMSG  KEY  UUID  TIMESTAMP  TEXT   received in a group
 //!   SENT  UUID  TIMESTAMP  TEXT   written on another device of ours to a contact
@@ -196,13 +197,56 @@ fn parse_key(hex_key: &str) -> anyhow::Result<GroupMasterKeyBytes> {
 
 // ---- contacts, groups, identity ----------------------------------------------------------------------------------
 
+/// Name without the invisible direction marks that Signal puts around synced names (U+2066..2069, U+200E/F).
+fn clean_name(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}')).collect::<String>().trim().to_string()
+}
+
+/// The name from the profile of a contact, when its profile key and the profile are in the store (no network).
+async fn cached_profile_name(m: &Mgr, uuid: Uuid) -> Option<String> {
+    let store = m.store();
+    let key = store.profile_key(&ServiceId::Aci(uuid.into())).await.ok()??;
+    let profile = store.profile(uuid, key).await.ok()??;
+    let name = clean_name(&profile.name?.to_string());
+    (!name.is_empty()).then_some(name)
+}
+
+/// The contacts with a name (the address book name, else the profile name; empty when neither is known) and their phone number.
 async fn contact_lines(m: &Mgr) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     for c in m.store().contacts().await.map_err(|e| anyhow!("{e}"))?.flatten() {
         let phone = c.phone_number.map(|p| p.to_string()).unwrap_or_default();
-        out.push(line(&["CONTACT", &c.uuid.to_string(), &c.name, &phone]));
+        let mut name = clean_name(&c.name);
+        if name.is_empty() {
+            name = cached_profile_name(m, c.uuid).await.unwrap_or_default();
+        }
+        out.push(line(&["CONTACT", &c.uuid.to_string(), &name, &phone]));
     }
     Ok(out)
+}
+
+/// Fetches the profiles (names) of contacts that have no name yet; presage stores them. True when something new was found.
+async fn fetch_missing_names(m: &Mgr) -> bool {
+    let mut todo = Vec::new();
+    if let Ok(contacts) = m.store().contacts().await {
+        for c in contacts.flatten() {
+            if clean_name(&c.name).is_empty() && cached_profile_name(m, c.uuid).await.is_none() {
+                if let Ok(Some(key)) = m.store().profile_key(&ServiceId::Aci(c.uuid.into())).await {
+                    todo.push((c.uuid, key));
+                }
+            }
+        }
+    }
+    let mut found = false;
+    for (uuid, key) in todo {
+        let mut mm = m.clone();
+        match mm.retrieve_profile_by_uuid(uuid, key).await {
+            Ok(p) if p.name.is_some() => found = true,
+            Ok(_) => debug!(%uuid, "the profile has no name"),
+            Err(e) => debug!(%uuid, "cannot fetch the profile: {e}"),
+        }
+    }
+    found
 }
 
 async fn group_lines(m: &Mgr) -> anyhow::Result<Vec<String>> {
@@ -276,7 +320,7 @@ fn incoming_line(content: &Content) -> Option<String> {
     }
 }
 
-async fn receive_loop(mut manager: Mgr, tx: broadcast::Sender<String>) {
+async fn receive_loop(mut manager: Mgr, tx: broadcast::Sender<String>, queue_empty: Rc<tokio::sync::Notify>) {
     loop {
         match manager.receive_messages().await {
             Err(e) => error!("cannot start receiving: {e}"),
@@ -285,7 +329,10 @@ async fn receive_loop(mut manager: Mgr, tx: broadcast::Sender<String>) {
                 pin_mut!(stream);
                 while let Some(received) = stream.next().await {
                     match received {
-                        Received::QueueEmpty => debug!("queue empty"),
+                        Received::QueueEmpty => {
+                            debug!("queue empty");
+                            queue_empty.notify_one();
+                        }
                         Received::Contacts => {
                             let _ = tx.send(line(&["CONTACTS-CHANGED"]));
                         }
@@ -420,7 +467,19 @@ async fn daemon(args: &Args, socket: Option<PathBuf>) -> anyhow::Result<()> {
 
     let (tx, _) = broadcast::channel(256);
     let shared = Rc::new(Shared { manager: manager.clone(), allow: args.allow.iter().copied().collect(), tx: tx.clone() });
-    tokio::task::spawn_local(receive_loop(manager, tx));
+    let queue_empty = Rc::new(tokio::sync::Notify::new());
+    tokio::task::spawn_local(receive_loop(manager.clone(), tx.clone(), queue_empty.clone()));
+    // Names of contacts without one come from their profiles; the plugin asks for the list again on CONTACTS-CHANGED.
+    // Only after the stored backlog was received: on the phone every new connection to the encrypted store takes ~13 s, and a
+    // fetch running beside the decryption exhausted the pool ("pool timed out", a message was skipped).
+    tokio::task::spawn_local(async move {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(180), queue_empty.notified()).await;
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        if fetch_missing_names(&manager).await {
+            info!("profile names fetched");
+            let _ = tx.send(line(&["CONTACTS-CHANGED"]));
+        }
+    });
     loop {
         let (stream, _) = listener.accept().await?;
         debug!("client connected");
